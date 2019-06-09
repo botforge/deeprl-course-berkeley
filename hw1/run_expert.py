@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 """
 Code to load an expert policy and generate roll-out data for behavioral cloning.
 Example usage:
@@ -36,7 +34,6 @@ def main():
 
         import gym
         env = gym.make(args.envname)
-        print()
         max_steps = args.max_timesteps or env.spec.timestep_limit
         returns = []
         observations = []
