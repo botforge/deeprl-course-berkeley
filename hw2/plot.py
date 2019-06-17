@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import json
 import os
+import pdb
 
 """
 Using the plotter:
@@ -63,7 +64,7 @@ def get_datasets(fpath, condition=None):
     datasets = []
     for root, dir, files in os.walk(fpath):
         if 'log.txt' in files:
-            param_path = open(os.path.join(root,'params.json'))
+            param_path = open(os.path.join(root,'hyperparams.json'))
             params = json.load(param_path)
             exp_name = params['exp_name']
             
@@ -86,7 +87,6 @@ def get_datasets(fpath, condition=None):
 
     return datasets
 
-
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -95,6 +95,7 @@ def main():
     parser.add_argument('--value', default='AverageReturn', nargs='*')
     args = parser.parse_args()
 
+    
     use_legend = False
     if args.legend is not None:
         assert len(args.legend) == len(args.logdir), \
@@ -106,6 +107,7 @@ def main():
         for logdir, legend_title in zip(args.logdir, args.legend):
             data += get_datasets(logdir, legend_title)
     else:
+        pdb.set_trace()
         for logdir in args.logdir:
             data += get_datasets(logdir)
 

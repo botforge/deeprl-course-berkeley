@@ -29,7 +29,6 @@ class PolicyNet(nn.Module):
             layers.extend([nn.Linear(layer_dims[i], layer_dims[i+1]), nn.Tanh()])
 
         self.model = nn.Sequential(*layers).apply(self.weights_init_)
-
         if not self.discrete:
             self.ts_logsigma = nn.Parameter(torch.randn((self.ac_dim, )))
         
@@ -49,7 +48,38 @@ class PolicyNet(nn.Module):
             ts_means_na = y
             ts_logsigma = self.ts_logsigma
             return (ts_means_na, ts_logsigma)
-            
+
+class ValueNet(nn.Module):
+    def __init__(self, neural_network_args):
+        super(ValueNet, self).__init__()
+        self.ob_dim = neural_network_args['ob_dim']
+        self.ac_dim = neural_network_args['ac_dim']
+        self.discrete = neural_network_args['discrete']
+        self.hidden_size = neural_network_args['size']
+        self.n_layers = neural_network_args['n_layers']
+
+        self.build_model()
+
+    def build_model(self):
+        layer_dims = [self.ob_dim] + [self.hidden_size] * self.n_layers + [1]
+        layers = []
+        for i in range(len(layer_dims) - 1):
+            layers.extend([nn.Linear(layer_dims[i], layer_dims[i+1]), nn.Tanh()])
+
+        self.model = nn.Sequential(*layers).apply(self.weights_init_)
+        
+    def weights_init_(self, m):
+        if hasattr(m, 'weight'):
+            nn.init.xavier_uniform_(m.weight)
+
+    def forward(self, ts_ob_no):
+        """
+        ts_ob_no: A Tensor with shape (batch_size * observation_dim)
+        Returns: y
+        """
+        returns = self.model(ts_ob_no)
+        return returns
+
 class Agent(object):
     def __init__(self, neural_network_args, sample_trajectory_args, estimate_return_args):
         super(Agent, self).__init__()
@@ -68,9 +98,13 @@ class Agent(object):
         self.reward_to_go = estimate_return_args['reward_to_go']
         self.nn_baseline = estimate_return_args['nn_baseline']
         self.normalize_advantages = estimate_return_args['normalize_advantages']
-
         self.policy_net = PolicyNet(neural_network_args)
+        params = list(self.policy_net.parameters())
 
+        if self.nn_baseline:
+            self.value_net = ValueNet(neural_network_args)
+            params += list(self.value_net.parameters())
+        self.optimizer = optim.Adam(params, lr=self.learning_rate)
     def sample_trajectory(self, env, animate):
         ob = env.reset()
         obs, acs, rewards = [], [], []
@@ -121,7 +155,7 @@ class Agent(object):
 
     def estimate_return(self, obs_no, re_n):
         #==================
-        #Transform re_n (num_episodes, each element is num_timesteps of that episode) to q_n (batchsize=sum_timesteps, 1)
+        #Transform re_n (num_episodes, each element is num_timesteps of that episode) to q_n (batchsize=sum_timesteps,)
         #===================
         sum_timesteps = obs_no.shape[0]
         q_n = np.array([])
@@ -130,7 +164,45 @@ class Agent(object):
         else:
         #Transforms re_n into q_n where each index is the sum of rewards of the path is belonged to * self.gamma 
             q_n = np.concatenate([np.full_like(re, scipy.signal.lfilter(b=[1], a=[1, -self.gamma], x=re[::-1])[-1]) for re in re_n])
- 
+        #==================
+        # Calculate  adv=(batchsize=sum_timesteps, ) by subtracting some baselines from estimated q_n=(batchsize=sum_timesteps, )
+        #===================
+        if self.nn_baseline:
+            #Use Neural network baseline value function that predictions expected return conditioned on a state
+            b_n = self.value_net(torch.from_numpy(obs_no)).view(-1).numpy()
+            b_n = (b_n - np.mean(b_n)) / (np.std(b_n) + 1e-7)
+            b_n = b_n * np.std(q_n) + np.mean(q_n)
+            adv_n = q_n - b_n
+        else:
+            adv_n = q_n.copy()
+        if self.normalize_advantages:
+            adv_n = (adv_n - np.mean(adv_n)) / (np.std(adv_n) + 1e-7)
+        return q_n, adv_n
+
+    def update_parameters(self, ob_no, ac_na, q_n, adv_n):
+        #convert numpy arrays to tensors
+        ts_ob_no, ts_ac_na, ts_qn, ts_adv_n = map(lambda x: torch.from_numpy(x), [ob_no, ac_na, q_n, adv_n])
+
+        #get Policy Distribution and log probabilities
+        policy_params = self.policy_net(ts_ob_no)
+        # pdb.set_trace()
+        if self.discrete:
+            ts_logits_na = policy_params
+            ts_logprob_n = torch.distributions.Categorical(logits=ts_logits_na).log_prob(ts_ac_na)
+        else:
+            ts_means_na, ts_logsigma = policy_params
+            ts_logprob_n = torch.distributions.Normal(ts_means_na, ts_logsigma.exp()).log_prob(ts_ac_na).sum(-1)
+
+        #clean gradient and backprop mate
+        loss = -(ts_logprob_n * ts_adv_n).mean()
+        loss.backward()
+        if self.nn_baseline:
+            baseline = self.value_net(ts_ob_no).view(-1)
+            ts_target_n = (ts_qn - ts_qn.mean()) / (ts_qn.std() + 1e-7)
+            baseline_loss = torch.nn.functional.mse_loss(baseline, ts_target_n)
+            baseline_loss.backward()
+        self.optimizer.step()
+
 def train_PG(exp_name, env_name,
         n_iter, 
         gamma, 
@@ -156,7 +228,7 @@ def train_PG(exp_name, env_name,
     args = inspect.getargspec(train_PG)[0]
     hyperparams = {k: locals_[k] if k in locals_ else None for k in args}
     logz.save_hyperparams(hyperparams)
-
+ 
     #==================
     #SETUP ENV
     #===================
@@ -216,6 +288,21 @@ def train_PG(exp_name, env_name,
         #Step 3: Update parameters using Policy Gradient
         agent.update_parameters(ob_no, ac_na, q_n, adv_n)
 
+        # Log diagnostics
+        returns = [path["reward"].sum() for path in paths]
+        ep_lengths = [len(path["reward"]) for path in paths]
+        logz.log_tabular("Time", time.time() - start)
+        logz.log_tabular("Iteration", itr)
+        logz.log_tabular("AverageReturn", np.mean(returns))
+        logz.log_tabular("StdReturn", np.std(returns))
+        logz.log_tabular("MaxReturn", np.max(returns))
+        logz.log_tabular("MinReturn", np.min(returns))
+        logz.log_tabular("EpLenMean", np.mean(ep_lengths))
+        logz.log_tabular("EpLenStd", np.std(ep_lengths))
+        logz.log_tabular("TimestepsThisBatch", timesteps_this_batch)
+        logz.log_tabular("TimestepsSoFar", total_timesteps)
+        logz.dump_tabular()
+        logz.save_pytorch_model(agent)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('env_name', type=str)
@@ -231,8 +318,8 @@ def main():
     parser.add_argument('--nn_baseline', '-bl', action='store_true')
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--n_experiments', '-e', type=int, default=1)
-    parser.add_argument('--n_layers', '-l', type=int, default=2)
-    parser.add_argument('--size', '-s', type=int, default=64)
+    parser.add_argument('--n_layers', '-l', type=int, default=3)
+    parser.add_argument('--size', '-s', type=int, default=32)
     args = parser.parse_args()
 
     if not(os.path.exists('data')):
@@ -255,12 +342,12 @@ def main():
                 exp_name=args.exp_name,
                 env_name=args.env_name,
                 n_iter=args.n_iter,
-                gamma=1.5,
+                gamma=args.discount,
                 min_timesteps_per_batch=args.batch_size,
                 max_path_length=max_path_length,
                 learning_rate=args.learning_rate,
-                reward_to_go=True,
-                animate=False,
+                reward_to_go=args.reward_to_go,
+                animate=args.render,
                 logdir=os.path.join(logdir,'%d'%seed),
                 normalize_advantages=not(args.dont_normalize_advantages),
                 nn_baseline=args.nn_baseline, 
@@ -268,14 +355,13 @@ def main():
                 n_layers=args.n_layers,
                 size=args.size
                 )
-        train_func()
-        # p = Process(target=train_func, args=tuple())
-        # p.start()
-        # processes.append(p)
+        # train_func()
+        p = Process(target=train_func, args=tuple())
+        p.start()
+        processes.append(p)
         # if you comment in the line below, then the loop will block 
         # until this process finishes
         # p.join()
-
     for p in processes:
         p.join()
 
