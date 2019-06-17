@@ -107,7 +107,6 @@ def main():
         for logdir, legend_title in zip(args.logdir, args.legend):
             data += get_datasets(logdir, legend_title)
     else:
-        pdb.set_trace()
         for logdir in args.logdir:
             data += get_datasets(logdir)
 
